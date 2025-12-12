@@ -19,7 +19,7 @@ def get_sqlalchemy_engine(database):
 def get_connection(database):
     """Create database connection"""
     return psycopg2.connect(
-        host="localhost",
+        host="https://pyflask-production.up.railway.app",
         database=database,
         user="postgres",
         password="postgre"
@@ -272,5 +272,6 @@ def download_file(filename):
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
+
 
 
