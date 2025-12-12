@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PostGIS + GeoPandas Analysis</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen">
+    <div class="container mx-auto p-4 md:p-8 max-w-4xl">
+        <div class="bg-white rounded-xl shadow-lg p-6 md:p-8">
+            <h1 class="text-3xl font-bold mb-2 text-gray-800">PostGIS + GeoPandas Buffer Analysis</h1>
+            <p class="text-gray-600 mb-6">Fetch from PostgreSQL, process with GeoPandas</p>
+            
+            <div id="alertContainer"></div>
+
+            <form id="analysisForm" class="space-y-6">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Database <span class="text-red-500">*</span></label>
+                    <select id="database" class="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-indigo-500">
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Line Table <span class="text-red-500">*</span></label>
+                        <select id="lineTable" disabled class="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-indigo-500">
+                            <option value="">Select database first</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Point Table <span class="text-red-500">*</span></label>
+                        <select id="pointTable" disabled class="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-indigo-500">
+                            <option value="">Select database first</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Buffer Size (meters)</label>
+                        <input type="number" id="bufferSize" value="30" min="1" class="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-indigo-500">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Tier Column Name</label>
+                        <input type="text" id="tierColumn" value="severity" placeholder="e.g., severity, injury" class="w-full border border-gray-300 rounded-lg p-2 focus:ring-2 focus:ring-indigo-500">
+                    </div>
+                </div>
+
+                <button type="submit" id="analyzeBtn" disabled class="w-full bg-indigo-600 text-white py-3 rounded-lg font-semibold hover:bg-indigo-700 transition-colors flex items-center justify-center">
+                    <span id="btnText">🚀 Run Analysis</span>
+                    <span id="btnSpinner" class="hidden">Processing...</span>
+                </button>
+            </form>
+        </div>
+
+        <div id="loading" class="hidden mt-6 bg-white rounded-xl shadow-lg p-6 text-center">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mx-auto mb-4"></div>
+            <p class="text-gray-600">Running spatial analysis...</p>
+        </div>
+
+        <div id="results" class="hidden mt-6 space-y-4">
+            <div class="bg-white rounded-xl shadow-lg p-6">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-2xl font-bold text-gray-800">📊 Results</h2>
+                    <div class="flex gap-2">
+                        <button id="downloadCsv" class="bg-green-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-green-700 transition-colors">
+                            📄 CSV
+                        </button>
+                        <button id="downloadGpkg" class="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 transition-colors">
+                            📦 GeoPackage
+                        </button>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                    <div class="bg-indigo-50 p-4 rounded-lg">
+                        <p class="text-sm text-gray-600">Points in Buffer</p>
+                        <p id="totalPoints" class="text-2xl font-bold text-indigo-600">0</p>
+                    </div>
+                    <div class="bg-indigo-50 p-4 rounded-lg">
+                        <p class="text-sm text-gray-600">Buffer Size</p>
+                        <p id="bufferSizeStat" class="text-2xl font-bold text-indigo-600">0m</p>
+                    </div>
+                    <div class="bg-indigo-50 p-4 rounded-lg">
+                        <p class="text-sm text-gray-600">Line Features</p>
+                        <p id="lineCount" class="text-2xl font-bold text-indigo-600">0</p>
+                    </div>
+                    <div class="bg-indigo-50 p-4 rounded-lg">
+                        <p class="text-sm text-gray-600">Total Points</p>
+                        <p id="totalPointsAll" class="text-2xl font-bold text-indigo-600">0</p>
+                    </div>
+                </div>
+
+                <div id="tierBreakdown" class="hidden mb-6">
+                    <h3 class="text-lg font-semibold text-gray-800 mb-4">Tier Distribution</h3>
+                    <div id="tierBars" class="space-y-3"></div>
+                </div>
+
+                <div>
+                    <h3 class="text-lg font-semibold text-gray-800 mb-4">Per-Line Statistics</h3>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead>
+                                <tr class="border-b-2 border-gray-300">
+                                    <th class="text-left py-2 px-3 font-semibold text-gray-700">Line ID</th>
+                                    <th class="text-center py-2 px-3 font-semibold text-gray-700">Points</th>
+                                    <th class="text-left py-2 px-3 font-semibold text-gray-700">Breakdown</th>
+                                </tr>
+                            </thead>
+                            <tbody id="resultsTable"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentDownloads = {};
+
+        function showAlert(message, type = 'error') {
+            const container = document.getElementById('alertContainer');
+            const colors = {
+                error: 'bg-red-50 border-red-200 text-red-800',
+                success: 'bg-green-50 border-green-200 text-green-800',
+                warning: 'bg-yellow-50 border-yellow-200 text-yellow-800'
+            };
+            container.innerHTML = `<div class="${colors[type]} border rounded-lg p-4 mb-4">${message}</div>`;
+            if (type !== 'error') setTimeout(() => container.innerHTML = '', 5000);
+        }
+
+        async function loadDatabases() {
+            try {
+                const res = await fetch('/api/databases');
+                const data = await res.json();
+                if (data.error) {
+                    showAlert(data.error);
+                    return;
+                }
+                const select = document.getElementById('database');
+                select.innerHTML = '<option value="">-- Select Database --</option>';
+                data.databases.forEach(db => {
+                    const opt = document.createElement('option');
+                    opt.value = db;
+                    opt.textContent = db;
+                    select.appendChild(opt);
+                });
+            } catch (e) {
+                showAlert('Failed to load databases: ' + e.message);
+            }
+        }
+
+        async function loadTables(database) {
+            try {
+                const res = await fetch('/api/tables', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({database})
+                });
+                const data = await res.json();
+                if (data.error) {
+                    showAlert(data.error);
+                    return;
+                }
+                
+                const lineSelect = document.getElementById('lineTable');
+                const pointSelect = document.getElementById('pointTable');
+                
+                lineSelect.innerHTML = '<option value="">-- Select Line Table --</option>';
+                pointSelect.innerHTML = '<option value="">-- Select Point Table --</option>';
+                
+                data.tables.forEach(table => {
+                    const lineOpt = document.createElement('option');
+                    lineOpt.value = table.name;
+                    lineOpt.textContent = `${table.name} (${table.geom_type})`;
+                    lineSelect.appendChild(lineOpt);
+                    
+                    const pointOpt = document.createElement('option');
+                    pointOpt.value = table.name;
+                    pointOpt.textContent = `${table.name} (${table.geom_type})`;
+                    pointSelect.appendChild(pointOpt);
+                });
+                
+                lineSelect.disabled = false;
+                pointSelect.disabled = false;
+                document.getElementById('analyzeBtn').disabled = false;
+            } catch (e) {
+                showAlert('Failed to load tables: ' + e.message);
+            }
+        }
+
+        document.getElementById('database').addEventListener('change', (e) => {
+            if (e.target.value) {
+                loadTables(e.target.value);
+            } else {
+                document.getElementById('lineTable').disabled = true;
+                document.getElementById('pointTable').disabled = true;
+                document.getElementById('analyzeBtn').disabled = true;
+            }
+        });
+
+        document.getElementById('analysisForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const database = document.getElementById('database').value;
+            const lineTable = document.getElementById('lineTable').value;
+            const pointTable = document.getElementById('pointTable').value;
+            const bufferSize = document.getElementById('bufferSize').value;
+            const tierColumn = document.getElementById('tierColumn').value;
+            
+            if (!database || !lineTable || !pointTable) {
+                showAlert('Please fill all required fields', 'warning');
+                return;
+            }
+            
+            document.getElementById('alertContainer').innerHTML = '';
+            document.getElementById('loading').classList.remove('hidden');
+            document.getElementById('results').classList.add('hidden');
+            document.getElementById('btnText').classList.add('hidden');
+            document.getElementById('btnSpinner').classList.remove('hidden');
+            document.getElementById('analyzeBtn').disabled = true;
+            
+            try {
+                const res = await fetch('/api/analyze', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({database, line_table: lineTable, point_table: pointTable, buffer_size: bufferSize, tier_column: tierColumn})
+                });
+                
+                const data = await res.json();
+                
+                if (data.error) {
+                    showAlert(data.error);
+                    return;
+                }
+                
+                currentDownloads = {
+                    csv: data.csv_download,
+                    gpkg: data.gpkg_download
+                };
+                
+                displayResults(data);
+                showAlert('Analysis completed successfully!', 'success');
+            } catch (e) {
+                showAlert('Analysis failed: ' + e.message);
+            } finally {
+                document.getElementById('loading').classList.add('hidden');
+                document.getElementById('btnText').classList.remove('hidden');
+                document.getElementById('btnSpinner').classList.add('hidden');
+                document.getElementById('analyzeBtn').disabled = false;
+            }
+        });
+
+        function displayResults(data) {
+            document.getElementById('totalPoints').textContent = data.total_points_in_buffer;
+            document.getElementById('bufferSizeStat').textContent = data.buffer_size + 'm';
+            document.getElementById('lineCount').textContent = data.line_count;
+            document.getElementById('totalPointsAll').textContent = data.total_points;
+            
+            if (data.overall_tier_counts && Object.keys(data.overall_tier_counts).length > 0) {
+                document.getElementById('tierBreakdown').classList.remove('hidden');
+                const tierBars = document.getElementById('tierBars');
+                tierBars.innerHTML = '';
+                const maxCount = Math.max(...Object.values(data.overall_tier_counts));
+                Object.entries(data.overall_tier_counts).sort().forEach(([tier, count]) => {
+                    const pct = (count / data.total_points_in_buffer * 100).toFixed(1);
+                    const width = (count / maxCount * 100).toFixed(1);
+                    tierBars.innerHTML += `
+                        <div class="flex items-center">
+                            <div class="w-32 text-sm font-medium text-gray-700">${tier}</div>
+                            <div class="flex-1 bg-gray-200 rounded-full h-8">
+                                <div class="bg-indigo-600 h-8 rounded-full flex items-center justify-between px-3 text-white text-sm font-semibold" style="width: ${width}%">
+                                    <span>${count}</span><span>${pct}%</span>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                });
+            }
+            
+            const table = document.getElementById('resultsTable');
+            table.innerHTML = '';
+            data.results_by_line.forEach(line => {
+                let breakdown = '-';
+                if (line.tier_counts) {
+                    breakdown = Object.entries(line.tier_counts).sort().map(([t, c]) => `${t}: ${c}`).join(', ');
+                }
+                table.innerHTML += `
+                    <tr class="border-b border-gray-200 hover:bg-gray-50">
+                        <td class="py-2 px-3">${line.line_id}</td>
+                        <td class="text-center py-2 px-3 font-semibold text-indigo-600">${line.total_points}</td>
+                        <td class="py-2 px-3 text-sm">${breakdown}</td>
+                    </tr>
+                `;
+            });
+            
+            document.getElementById('results').classList.remove('hidden');
+        }
+
+        document.getElementById('downloadCsv').addEventListener('click', () => {
+            if (currentDownloads.csv) {
+                window.location.href = `/api/download/${currentDownloads.csv}`;
+            }
+        });
+
+        document.getElementById('downloadGpkg').addEventListener('click', () => {
+            if (currentDownloads.gpkg) {
+                window.location.href = `/api/download/${currentDownloads.gpkg}`;
+            }
+        });
+
+        loadDatabases();
+    </script>
+</body>
+</html>
