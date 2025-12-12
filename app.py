@@ -14,7 +14,7 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 def get_sqlalchemy_engine(database):
     """Create SQLAlchemy engine for GeoPandas"""
-    return create_engine(f'postgresql://postgres:postgre@localhost:5432/{database}')
+    return create_engine(f'postgresql://postgres:postgre@https://pyflask-production.up.railway.app/{database}')
 
 def get_connection(database):
     """Create database connection"""
@@ -272,4 +272,5 @@ def download_file(filename):
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
+
 
