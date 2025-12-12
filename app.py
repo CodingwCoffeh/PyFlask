@@ -1,29 +1,37 @@
+# app.py
 from flask import Flask, render_template, request, jsonify, send_file
 import psycopg2
 import geopandas as gpd
 from sqlalchemy import create_engine
-import tempfile
 import os
 from datetime import datetime
 import warnings
+import urllib.parse
+
 warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
+
+# Use Railway's provided PORT and temporary directory
+app.config['UPLOAD_FOLDER'] = '/tmp/uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-def get_sqlalchemy_engine(database):
-    """Create SQLAlchemy engine for GeoPandas"""
-    return create_engine(f'postgresql://postgres:postgre@https://pyflask-production.up.railway.app/{database}')
+# Railway provides DATABASE_URL like: postgres://user:pass@host:port/db
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-def get_connection(database):
-    """Create database connection"""
-    return psycopg2.connect(
-        host="https://pyflask-production.up.railway.app",
-        database=database,
-        user="postgres",
-        password="postgre"
-    )
+def get_sqlalchemy_engine():
+    """Create SQLAlchemy engine from DATABASE_URL"""
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL not set")
+    return create_engine(DATABASE_URL)
+
+def get_connection():
+    """Create psycopg2 connection"""
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL not set")
+    return psycopg2.connect(DATABASE_URL)
 
 @app.route('/')
 def index():
@@ -31,36 +39,19 @@ def index():
 
 @app.route('/api/databases', methods=['GET'])
 def get_databases():
-    """Get list of all databases"""
+    """Railway has only one DB, so return its name"""
     try:
-        conn = psycopg2.connect(
-            host="localhost",
-            database="postgres",
-            user="postgres",
-            password="postgre"
-        )
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT datname FROM pg_database 
-            WHERE datistemplate = false 
-            ORDER BY datname;
-        """)
-        databases = [row[0] for row in cur.fetchall()]
-        cur.close()
-        conn.close()
-        return jsonify({'databases': databases})
+        # Extract database name from DATABASE_URL
+        parsed = urllib.parse.urlparse(DATABASE_URL)
+        db_name = parsed.path[1:]  # remove leading /
+        return jsonify({'databases': [db_name]})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/tables', methods=['POST'])
 def get_tables():
-    """Get all spatial tables from database"""
     try:
-        database = request.json.get('database')
-        if not database:
-            return jsonify({'error': 'Database name required'}), 400
-        
-        conn = get_connection(database)
+        conn = get_connection()
         cur = conn.cursor()
         cur.execute("""
             SELECT f_table_name, f_geometry_column, type
@@ -78,25 +69,20 @@ def get_tables():
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
-    """Run buffer analysis using GeoPandas"""
     try:
         data = request.json
-        database = data.get('database')
         line_table = data.get('line_table')
         point_table = data.get('point_table')
         buffer_size = float(data.get('buffer_size', 30))
         tier_column = data.get('tier_column', 'severity')
-        
-        if not all([database, line_table, point_table]):
+
+        if not all([line_table, point_table]):
             return jsonify({'error': 'Missing required parameters'}), 400
-        
-        print(f"Analyzing: {database} | Lines: {line_table} | Points: {point_table} | Buffer: {buffer_size}m")
-        
-        # Create SQLAlchemy engine
-        engine = get_sqlalchemy_engine(database)
-        
-        # Get geometry column names first
-        conn = get_connection(database)
+
+        engine = get_sqlalchemy_engine()
+
+        # Get geometry columns
+        conn = get_connection()
         cur = conn.cursor()
         cur.execute("""
             SELECT f_table_name, f_geometry_column
@@ -104,174 +90,129 @@ def analyze():
             WHERE f_table_schema = 'public'
             AND f_table_name IN (%s, %s);
         """, (line_table, point_table))
-        
         geom_info = {row[0]: row[1] for row in cur.fetchall()}
         cur.close()
         conn.close()
-        
+
         if line_table not in geom_info or point_table not in geom_info:
-            return jsonify({'error': 'Could not find geometry columns for tables'}), 400
-        
+            return jsonify({'error': 'Geometry columns not found'}), 400
+
         line_geom_col = geom_info[line_table]
         point_geom_col = geom_info[point_table]
-        
-        print(f"Geometry columns - Line: {line_geom_col}, Point: {point_geom_col}")
-        
-        # Read layers with GeoPandas
+
+        # Read data
         lines = gpd.read_postgis(f"SELECT * FROM {line_table}", engine, geom_col=line_geom_col)
         points = gpd.read_postgis(f"SELECT * FROM {point_table}", engine, geom_col=point_geom_col)
-        
-        print(f"Loaded {len(lines)} lines and {len(points)} points")
-        
-        # Check CRS and reproject if needed
+
+        if lines.empty or points.empty:
+            return jsonify({'error': 'One or both tables are empty'}), 400
+
+        # Reproject if needed
         if lines.crs != points.crs:
             points = points.to_crs(lines.crs)
-            print("Reprojected points to match lines")
-        
-        # Reproject to UTM if in lat/lon for metric buffering
+
+        # Project to metric CRS for buffering
         if lines.crs.is_geographic:
             centroid = lines.unary_union.centroid
-            lon, lat = centroid.x, centroid.y
+            lon, lat, lon = centroid.y, centroid.x
             utm_zone = int((lon + 180) / 6) + 1
             hemisphere = 'north' if lat >= 0 else 'south'
-            utm_crs = f"+proj=utm +zone={utm_zone} +{hemisphere} +datum=WGS84 +units=m +no_defs"
-            
-            lines_proj = lines.to_crs(utm_crs)
-            points_proj = points.to_crs(utm_crs)
-            print(f"Reprojected to UTM Zone {utm_zone}{hemisphere[0].upper()}")
+            utm_crs = f"EPSG:32{'6' if hemisphere == 'north' else '7'}{utm_zone:02d}"
+            try:
+                lines_proj = lines.to_crs(utm_crs)
+                points_proj = points.to_crs(utm_crs)
+            except:
+                # Fallback to custom proj string
+                utm_crs = f"+proj=utm +zone={utm_zone} +{'north' if hemisphere == 'north' else 'south'} +datum=WGS84 +units=m"
+                lines_proj = lines.to_crs(utm_crs)
+                points_proj = points.to_crs(utm_crs)
         else:
             lines_proj = lines.copy()
             points_proj = points.copy()
-        
-        # Create buffers
+
+        # Buffer and spatial join
         lines_proj['buffer'] = lines_proj.geometry.buffer(buffer_size)
-        
-        # Find unique points in ANY buffer
         all_buffers = lines_proj['buffer'].unary_union
         points_in_buffer = points_proj[points_proj.geometry.within(all_buffers)].copy()
-        
-        total_points = len(points_in_buffer)
-        print(f"Found {total_points} points in buffer")
-        
-        # Check if tier column exists
+
+        total_in_buffer = len(points_in_buffer)
+
+        # Tier counts
         tier_col_found = None
-        for col in [tier_column, tier_column.lower(), tier_column.upper(), tier_column.capitalize()]:
-            if col in points_in_buffer.columns:
+        for col in points_in_buffer.columns:
+            if col.lower() == tier_column.lower():
                 tier_col_found = col
                 break
-        
-        # Count by tier
+
         tier_counts = {}
-        if tier_col_found and total_points > 0:
+        if tier_col_found and total_in_buffer > 0:
             counts = points_in_buffer[tier_col_found].value_counts()
             tier_counts = {str(k): int(v) for k, v in counts.items()}
-        
-        # Per-line statistics
+
+        # Per-line results
         results_by_line = []
-        for idx, line_row in lines_proj.iterrows():
-            buffer_geom = line_row['buffer']
-            points_in_line = points_proj[points_proj.geometry.within(buffer_geom)]
-            count = len(points_in_line)
-            
-            if count == 0:
+        for idx, row in lines_proj.iterrows():
+            buf = row['buffer']
+            pts = points_proj[points_proj.geometry.within(buf)]
+            if len(pts) == 0:
                 continue
-            
-            # Get line ID
-            line_id = idx + 1
-            if 'gid' in line_row.index:
-                line_id = line_row['gid']
-            elif 'id' in line_row.index:
-                line_id = line_row['id']
-            
-            line_result = {
-                "line_id": line_id,
-                "total_points": count
-            }
-            
-            if tier_col_found and count > 0:
-                tier_counts_line = points_in_line[tier_col_found].value_counts().to_dict()
-                line_result["tier_counts"] = {str(k): int(v) for k, v in tier_counts_line.items()}
-            
-            results_by_line.append(line_result)
-        
-        # Store data for download
+            line_id = row.get('gid') or row.get('id') or idx
+            res = {"line_id": line_id, "total_points": len(pts)}
+            if tier_col_found:
+                tc = pts[tier_col_found].value_counts().to_dict()
+                res["tier_counts"] = {str(k): int(v) for k, v in tc.items()}
+            results_by_line.append(res)
+
+        # Save outputs to /tmp (Railway allows writing here)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Save points to CSV
-        csv_filename = f'points_in_buffer_{timestamp}.csv'
-        csv_path = os.path.join(app.config['UPLOAD_FOLDER'], csv_filename)
-        
-        # Drop geometry column (use actual column name)
-        geom_col_name = points_in_buffer.geometry.name
-        points_csv = points_in_buffer.drop(columns=[geom_col_name])
-        points_csv.to_csv(csv_path, index=False)
-        
-        # Save to GeoPackage
-        gpkg_filename = f'analysis_{timestamp}.gpkg'
-        gpkg_path = os.path.join(app.config['UPLOAD_FOLDER'], gpkg_filename)
-        
-        # Reproject back to original CRS for output
-        original_crs = lines.crs
-        
-        # Layer 1: Original lines
-        lines.to_file(gpkg_path, driver='GPKG', layer='original_lines')
-        
-        # Layer 2: All points
-        points.to_file(gpkg_path, driver='GPKG', layer='all_points')
-        
-        # Layer 3: Points in buffer
-        points_in_buffer_orig = points_in_buffer.to_crs(original_crs)
-        points_in_buffer_orig.to_file(gpkg_path, driver='GPKG', layer='points_in_buffer')
-        
-        # Layer 4: Buffer polygons
-        buffer_gdf = gpd.GeoDataFrame(
-            {'line_id': range(len(lines_proj)), 'buffer_m': buffer_size},
-            geometry=lines_proj['buffer'].values,
-            crs=lines_proj.crs
-        )
-        buffer_gdf_orig = buffer_gdf.to_crs(original_crs)
-        buffer_gdf_orig.to_file(gpkg_path, driver='GPKG', layer='buffers')
-        
+        csv_file = f'points_{timestamp}.csv'
+        gpkg_file = f'analysis_{timestamp}.gpkg'
+
+        csv_path = os.path.join(app.config['UPLOAD_FOLDER'], csv_file)
+        gpkg_path = os.path.join(app.config['UPLOAD_FOLDER'], gpkg_file)
+
+        # CSV
+        points_in_buffer.drop(columns=['geometry'], errors='ignore').to_csv(csv_path, index=False)
+
+        # GeoPackage
+        orig_crs = lines.crs
+        lines.to_file(gpkg_path, layer='original_lines', driver='GPKG')
+        points.to_file(gpkg_path, layer='all_points', driver='GPKG')
+        points_in_buffer.to_crs(orig_crs).to_file(gpkg_path, layer='points_in_buffer', driver='GPKG')
+        gpd.GeoDataFrame({'buffer_m': [buffer_size]}, geometry=lines_proj['buffer'], crs=lines_proj.crs)\
+           .to_crs(orig_crs).to_file(gpkg_path, layer='buffers', driver='GPKG')
+
         return jsonify({
             'success': True,
-            'total_points_in_buffer': total_points,
+            'total_points_in_buffer': total_in_buffer,
             'total_points': len(points),
             'line_count': len(lines),
             'buffer_size': buffer_size,
-            'tier_column': tier_col_found if tier_col_found else f"{tier_column} (not found)",
+            'tier_column': tier_col_found or "(not found)",
             'overall_tier_counts': tier_counts,
             'results_by_line': results_by_line,
-            'csv_download': csv_filename,
-            'gpkg_download': gpkg_filename
+            'csv_download': csv_file,
+            'gpkg_download': gpkg_file
         })
-        
+
     except Exception as e:
-        print(f"ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/download/<filename>')
 def download_file(filename):
-    """Download generated file"""
-    try:
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        if not os.path.exists(file_path):
-            return jsonify({'error': 'File not found'}), 404
-        
-        if filename.endswith('.csv'):
-            mimetype = 'text/csv'
-        elif filename.endswith('.gpkg'):
-            mimetype = 'application/geopackage+sqlite3'
-        else:
-            mimetype = 'application/octet-stream'
-        
-        return send_file(file_path, as_attachment=True, download_name=filename, mimetype=mimetype)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    if not os.path.exists(file_path):
+        return jsonify({'error': 'File not found'}), 404
+    return send_file(
+        file_path,
+        as_attachment=True,
+        download_name=filename,
+        mimetype='application/geopackage+sqlite3' if filename.endswith('.gpkg') else 'text/csv'
+    )
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
-
-
-
+    # Railway uses PORT env var
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
